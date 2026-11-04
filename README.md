@@ -148,6 +148,89 @@ Yeah. `claude -p "hi" --model haiku --no-session-persistence` in a cron or macOS
 
 **Token expiry?** About a year. Set a reminder.
 
+## Running the schedule from Cloudflare Workers
+
+GitHub's `on.schedule` is best-effort. In practice the runs can start hours late or stop firing altogether (forks are disabled by default, and GitHub silently pauses schedules). This repo's schedule stopped after April 21 and did not come back, and the upstream repo's runs were hours behind their cron. A [Cloudflare Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/) fires on the minute, so the workflow here is started by a small Worker instead.
+
+```
+Cloudflare Cron Trigger (04:17 UTC, Mon-Fri)
+        |
+        v
+Worker `claude-warmup-trigger`  --POST /actions/workflows/warmup.yml/dispatches-->  GitHub
+                                                                                      |
+                                                                                      v
+                                                          warmup.yml runs `claude -p "hi"`
+```
+
+The workflow keeps `workflow_dispatch` only; the `schedule:` block was removed so the two triggers don't double-fire. The Claude OAuth token (`CLAUDE_OAUTH_TOKEN`) stays a GitHub Actions secret as described above. The Worker only needs a GitHub token that is allowed to dispatch the workflow.
+
+The Worker code lives in [`worker/`](worker/).
+
+### Setup
+
+**1. GitHub token for the Worker.** Create a fine-grained personal access token at <https://github.com/settings/personal-access-tokens/new>:
+
+- **Repository access:** *Only select repositories* -> this repo. Do **not** leave the default *Public repositories*, which is read-only and returns `403`.
+- **Repository permissions:** **Actions: Read and write** (plus Metadata: Read-only, added automatically). This is the permission `workflow_dispatch` needs. Don't confuse it with *Account permissions*.
+- **Expiration:** pick a real date (not today) and note it. When the token expires the Worker gets `403` and the warmup stops silently, so renew it before then.
+
+**2. Cloudflare login.**
+
+```bash
+npx wrangler login
+npx wrangler whoami   # confirm the right account
+```
+
+**3. Configure and deploy.** Edit `worker/wrangler.toml`:
+
+- `crons`: the schedule, in UTC (Cloudflare uses the same 5-field syntax as GitHub). The default is `17 4 * * 1-5`.
+- `GITHUB_REPO`, `GITHUB_WORKFLOW`, `GITHUB_REF`: the repo (`owner/name`), workflow file and branch to dispatch.
+
+```bash
+cd worker
+npx wrangler deploy
+```
+
+**4. Store the GitHub token as a Worker secret.**
+
+```bash
+npx wrangler secret put GITHUB_TOKEN
+```
+
+The name is passed on the command line (`GITHUB_TOKEN`). Wrangler then asks only for the **value**: paste the token there. If it asks for a *name* too, you ran the command without the argument and the token would be stored as the secret's name. In that case delete the secret and start over:
+
+```bash
+npx wrangler secret list      # should show only GITHUB_TOKEN
+npx wrangler secret delete <wrong-name>
+```
+
+Secrets are kept across `wrangler deploy`. Names are visible in plain text, so never put the token anywhere but the value.
+
+### Changing the schedule
+
+Edit `crons` in `worker/wrangler.toml` and run `npx wrangler deploy`. A schedule change takes several minutes to propagate, so a cron set only a couple of minutes ahead may be skipped. When testing, set it at least ~15 minutes ahead and don't redeploy before it fires.
+
+### Verifying that it works
+
+1. **Wait for a scheduled run.** Check the Actions tab, or:
+   ```bash
+   gh run list -R <owner>/claude-warmup --event workflow_dispatch --limit 3
+   ```
+2. **Check Worker logs** (observability is enabled in `wrangler.toml`): Cloudflare dashboard -> Workers & Pages -> `claude-warmup-trigger` -> Observability. A healthy run logs `cron fired: ...` followed by `dispatch status=204`. The tail command (`npx wrangler tail claude-warmup-trigger`) also works but can be flaky on poor connections.
+3. **Check the registered schedule:** Workers & Pages -> `claude-warmup-trigger` -> Settings -> Triggers -> Cron Triggers.
+
+### Troubleshooting the Cloudflare setup
+
+| Symptom | Cause / fix |
+| --- | --- |
+| Log shows `dispatch status=403 ... Resource not accessible by personal access token` | Token is read-only: check *Repository access* is the specific repo and *Actions* is **Read and write**. |
+| Log shows `401 Bad credentials` | `GITHUB_TOKEN` is missing, wrong or expired. Check `wrangler secret list` and renew the token. |
+| Log shows `404` | `GITHUB_REPO`, `GITHUB_WORKFLOW` or the token's repository access is wrong. |
+| `wrangler secret list` shows a `github_pat_...` name | The token was entered as the secret name. Delete that secret, **revoke the token on GitHub**, create a new one and redo step 4. |
+| `Required Worker name missing` | Wrangler ran outside `worker/` (no `wrangler.toml`). `cd worker` first or pass `--name claude-warmup-trigger`. |
+| Nothing fires at the expected minute after a schedule change | Cron changes need several minutes to propagate. Wait and don't redeploy repeatedly. |
+| No logs at all | Make sure `[observability] enabled = true` is in `wrangler.toml` and redeploy. |
+
 ## Troubleshooting
 
 **`workflow not found on the default branch`**
